@@ -16,10 +16,26 @@ internal class InAppPresenter {
     private var current: InAppMessage? = null
     private var dialog: Dialog? = null
     private var banner: View? = null
+    private var htmlDialog: InAppHtmlDialog? = null
     private var hostActivity: Activity? = null
 
-    fun enqueue(messages: List<InAppMessage>) {
-        messages.filter { it.kind == InAppMessage.Kind.MESSAGE }.forEach { message ->
+    /** The contact the queued and shown messages were fetched for. */
+    private var owner: String? = null
+
+    /** After identify: another contact's messages go before they can act for the new one. */
+    fun signedIn(email: String?) {
+        if (email == owner) return
+        dismissAll()
+        owner = email
+    }
+
+    fun enqueue(messages: List<InAppMessage>, owner: String?) {
+        signedIn(owner)
+        // An html item without its document came from a caller that did not
+        // ask for html; it can't be drawn natively.
+        messages.filter {
+            it.kind == InAppMessage.Kind.MESSAGE && (it.resolvedFormat != InAppMessage.Format.HTML || it.html != null)
+        }.forEach { message ->
             if (message.id in shownIds || current?.id == message.id || queue.any { it.id == message.id }) return@forEach
             queue.addLast(message)
         }
@@ -29,6 +45,7 @@ internal class InAppPresenter {
     fun dismissAll() {
         queue.clear()
         shownIds.clear()
+        owner = null
         hide()
     }
 
@@ -70,11 +87,26 @@ internal class InAppPresenter {
         current = message
         hostActivity = activity
         shownIds.add(message.id)
+        if (message.resolvedFormat == InAppMessage.Format.HTML) {
+            // Reported displayed once the document has loaded; one that fails
+            // to load stays in the feed for a later launch.
+            val html = InAppHtmlDialog(
+                activity,
+                message,
+                onLoaded = { Sequenzy.reportFromPresenter(InAppEventType.DISPLAYED, message.id) },
+                onFinish = { outcome -> finishHtml(activity, message, outcome) },
+                isForSignedInContact = { Sequenzy.signedInEmail == owner },
+            )
+            htmlDialog = html
+            html.show()
+            return
+        }
         val views = MessageViews(activity, message) { outcome -> finish(activity, message, outcome) }
         when (message.resolvedFormat) {
             InAppMessage.Format.MODAL -> dialog = views.modalDialog().also { it.show() }
             InAppMessage.Format.FULLSCREEN -> dialog = views.fullscreenDialog().also { it.show() }
             InAppMessage.Format.BANNER -> banner = views.banner().also { bannerRoot?.addView(it) }
+            InAppMessage.Format.HTML -> Unit
         }
         Sequenzy.reportFromPresenter(InAppEventType.DISPLAYED, message.id)
     }
@@ -93,7 +125,25 @@ internal class InAppPresenter {
         showNextIfIdle()
     }
 
+    private fun finishHtml(activity: Activity, message: InAppMessage, outcome: InAppHtmlDialog.Outcome) {
+        if (current?.id != message.id) return
+        htmlDialog = null
+        val forOwner = Sequenzy.signedInEmail == owner
+        when (outcome) {
+            is InAppHtmlDialog.Outcome.Dismissed ->
+                if (forOwner) Sequenzy.reportFromPresenter(InAppEventType.DISMISSED, message.id)
+            // The click was reported with its button id when the document
+            // asked to open the link.
+            is InAppHtmlDialog.Outcome.Opened -> if (forOwner) Sequenzy.open(activity, outcome.url, message)
+            is InAppHtmlDialog.Outcome.Failed -> Unit
+        }
+        hide()
+        showNextIfIdle()
+    }
+
     private fun hide() {
+        htmlDialog?.dismiss()
+        htmlDialog = null
         dialog?.setOnDismissListener(null)
         dialog?.takeIf { it.isShowing }?.dismiss()
         dialog = null

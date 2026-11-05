@@ -12,7 +12,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 
 /** An item in the contact's in-app feed: a message shown over the app, or a content card. */
-data class InAppMessage(
+data class InAppMessage @JvmOverloads constructor(
     val id: String,
     val kind: Kind,
     val format: Format?,
@@ -33,9 +33,15 @@ data class InAppMessage(
     val eyebrow: String = "",
     /** Modals and full screens with an image. */
     val imagePlacement: ImagePlacement? = null,
+    /** `HTML` messages: the document to load, with the bridge already in it. */
+    val html: String? = null,
+    /** `HTML` messages: draw a close button over the document. */
+    val showCloseButton: Boolean = false,
 ) {
     enum class Kind(val wire: String) { MESSAGE("message"), CARD("card") }
-    enum class Format(val wire: String) { MODAL("modal"), BANNER("banner"), FULLSCREEN("fullscreen") }
+
+    /** `HTML`: a custom HTML message rendered in a sandboxed WebView (see [InAppHtmlBridgeMessage]). */
+    enum class Format(val wire: String) { MODAL("modal"), BANNER("banner"), FULLSCREEN("fullscreen"), HTML("html") }
 
     /** Banners: top or bottom. Modals: bottom (a sheet) or center. */
     enum class Position(val wire: String) { TOP("top"), BOTTOM("bottom"), CENTER("center") }
@@ -72,6 +78,8 @@ data class InAppMessage(
                 dismissedAt = obj.string("dismissedAt"),
                 eyebrow = obj.string("eyebrow") ?: "",
                 imagePlacement = ImagePlacement.entries.firstOrNull { it.wire == obj.string("imagePlacement") },
+                html = obj.string("html"),
+                showCloseButton = (obj["showCloseButton"] as? JsonPrimitive)?.booleanOrNull ?: false,
             )
         }
 

@@ -339,6 +339,81 @@ class SequenzyCoreTest {
     }
 
     @Test
+    fun `custom HTML bridge messages match the shared contract`() {
+        val fixture = Json.parseToJsonElement(Contract.text("in-app-html-bridge.json")).jsonObject
+        fun describe(message: InAppHtmlBridgeMessage): JsonElement = when (message) {
+            is InAppHtmlBridgeMessage.Close -> Json.parseToJsonElement("""{"method":"close"}""")
+            is InAppHtmlBridgeMessage.OpenUrl -> JsonObject(
+                buildMap {
+                    put("method", JsonPrimitive("openUrl"))
+                    put("url", JsonPrimitive(message.url))
+                    put("external", JsonPrimitive(message.external))
+                    message.buttonId?.let { put("buttonId", JsonPrimitive(it)) }
+                },
+            )
+            is InAppHtmlBridgeMessage.LogClick -> JsonObject(
+                buildMap {
+                    put("method", JsonPrimitive("logClick"))
+                    message.buttonId?.let { put("buttonId", JsonPrimitive(it)) }
+                },
+            )
+            is InAppHtmlBridgeMessage.Track -> JsonObject(
+                mapOf("method" to JsonPrimitive("track"), "name" to JsonPrimitive(message.name), "properties" to bridgeJson(message.properties)),
+            )
+            is InAppHtmlBridgeMessage.SetAttributes -> JsonObject(
+                mapOf("method" to JsonPrimitive("setAttributes"), "attributes" to bridgeJson(message.attributes)),
+            )
+            is InAppHtmlBridgeMessage.SetName -> JsonObject(
+                buildMap {
+                    put("method", JsonPrimitive("setName"))
+                    message.firstName?.let { put("firstName", JsonPrimitive(it)) }
+                    message.lastName?.let { put("lastName", JsonPrimitive(it)) }
+                },
+            )
+        }
+        for (entry in fixture["valid"]!!.jsonArray) {
+            val parsed = assertNotNull(InAppHtmlBridgeMessage.parse(entry.jsonObject["input"].toString()), entry.toString())
+            assertEquals(normalize(entry.jsonObject["expected"]!!), normalize(describe(parsed)), entry.toString())
+        }
+        for (input in fixture["invalid"]!!.jsonArray) {
+            assertNull(InAppHtmlBridgeMessage.parse(input.toString()), input.toString())
+        }
+        assertNull(InAppHtmlBridgeMessage.parse("""{"__sequenzyInApp":1,"method":"track","args":{"name":"${"x".repeat(40_000)}"}}"""))
+        assertEquals(fixture["maxMessageBytes"]!!.jsonPrimitive.content.toInt(), InAppHtmlBridgeMessage.MAX_MESSAGE_BYTES)
+        assertEquals(fixture["maxCallsPerDisplay"]!!.jsonPrimitive.content.toInt(), InAppHtmlBridgeMessage.MAX_CALLS_PER_DISPLAY)
+        val urls = fixture["urls"]!!.jsonObject
+        urls["allowed"]!!.jsonArray.forEach { assertTrue(InAppHtmlBridgeMessage.isAllowedUrl(it.jsonPrimitive.content), it.toString()) }
+        urls["blocked"]!!.jsonArray.forEach { assertTrue(!InAppHtmlBridgeMessage.isAllowedUrl(it.jsonPrimitive.content), it.toString()) }
+    }
+
+    @Test
+    fun `custom HTML messages are fetched only when asked for and clicks carry button ids`() = runBlocking<Unit> {
+        transport.respond("/api/v1/in-app/feed", 200, Contract.text("feed-response-html.json"))
+        val client = client()
+        client.identify(email, identityToken)
+        val messages = client.fetchFeed(
+            InAppMessage.Kind.MESSAGE,
+            null,
+            listOf(InAppMessage.Format.MODAL, InAppMessage.Format.BANNER, InAppMessage.Format.FULLSCREEN, InAppMessage.Format.HTML),
+        )
+        assertMatchesContract(transport.to("/api/v1/in-app/feed").last(), "fetchFeedWithHtml")
+        val message = messages.single()
+        assertEquals(InAppMessage.Format.HTML, message.format)
+        assertTrue(message.showCloseButton)
+        assertTrue(message.html!!.contains("brazeBridge.logClick"))
+
+        assertTrue(client.report(InAppEventType.CLICKED, "iam_html", "0"))
+        assertMatchesContract(transport.requests.last(), "reportInAppHtmlClick")
+        client.report(InAppEventType.CLICKED, "iam_html", "<b>")
+        assertNull(transport.requests.last().json()["buttonId"])
+
+        // Native items from older servers have no html fields.
+        val native = InAppMessage.listFromFeed(Json.parseToJsonElement(Contract.text("feed-response.json")))
+        assertNull(native.first().html)
+        assertTrue(!native.first().showCloseButton)
+    }
+
+    @Test
     fun `fetching the feed requires identity`() = runBlocking<Unit> {
         assertFailsWith<SequenzyException.NotIdentified> { client().fetchFeed() }
     }
@@ -501,3 +576,26 @@ class SequenzyCoreTest {
         assertEquals(InAppMessage.Position.CENTER, centered?.position)
     }
 }
+
+private fun bridgeJson(value: Any?): JsonElement = when (value) {
+    null -> JsonNull
+    is String -> JsonPrimitive(value)
+    is Boolean -> JsonPrimitive(value)
+    is Number -> JsonPrimitive(value)
+    is Map<*, *> -> JsonObject(value.entries.associate { (key, item) -> key.toString() to bridgeJson(item) })
+    is List<*> -> JsonArray(value.map(::bridgeJson))
+    else -> JsonPrimitive(value.toString())
+}
+
+/** Numbers compare by value (9 and 9.0 are the same JSON number). */
+private fun normalize(element: JsonElement): JsonElement = when (element) {
+    is JsonObject -> JsonObject(element.mapValues { normalize(it.value) })
+    is JsonArray -> JsonArray(element.map(::normalize))
+    is JsonPrimitive -> if (!element.isString && element.content.toDoubleOrNull() != null) {
+        JsonPrimitive(element.content.toDouble())
+    } else {
+        element
+    }
+    else -> element
+}
+

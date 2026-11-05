@@ -11,7 +11,7 @@ plugins {
 
 allprojects {
     group = "com.sequenzy"
-    version = "0.1.0"
+    version = "0.1.1"
 }
 
 // Maven Central metadata shared by sequenzy-core and sequenzy-android. The

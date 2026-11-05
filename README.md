@@ -10,7 +10,7 @@ Full guide: [Mobile SDKs](https://docs.sequenzy.com/concepts/mobile-sdks).
 
 ```kotlin
 dependencies {
-    implementation("com.sequenzy:sequenzy-android:0.1.0")
+    implementation("com.sequenzy:sequenzy-android:0.1.1")
     implementation("com.google.firebase:firebase-messaging:24.1.0") // for push
 }
 ```
@@ -49,6 +49,18 @@ only at suspension points. Ask for `POST_NOTIFICATIONS` on Android 13+. With a `
 `onNewIntent`. Set
 `Sequenzy.inAppListener` to veto messages or open links yourself, and
 `Sequenzy.notificationIcon` for the small icon.
+
+## Custom HTML messages
+
+[Custom HTML in-app messages](https://docs.sequenzy.com/concepts/in-app-html-messages) (surveys, Braze-style custom HTML) show
+automatically in a sandboxed `WebView` (no file or content access, no mixed
+content, no third-party cookies; each message clears its origin's storage
+and cookies before its scripts run). Their JavaScript bridge closes the message,
+opens links through `SequenzyInAppListener`, and logs events and attributes
+for the identified contact. Set `Sequenzy.showsHtmlMessages = false` before
+`configure` to leave them in the feed, or call
+`fetchMessages(includeHtml = true)` to present them yourself. The SDK's
+consumer ProGuard rules keep the bridge when your app is minified.
 
 ## Layout
 

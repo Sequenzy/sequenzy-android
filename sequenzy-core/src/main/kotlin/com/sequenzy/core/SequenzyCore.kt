@@ -25,7 +25,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 
-const val SEQUENZY_SDK_VERSION = "0.1.0"
+const val SEQUENZY_SDK_VERSION = "0.1.1"
 
 data class SequenzyConfiguration(
     /** Publishable key (`seq_pk_...`) restricted to this app's package name. */
@@ -614,7 +614,18 @@ class SequenzyCore(
     // region In-app
 
     /** Open messages or cards for the identified contact, in server order. */
-    suspend fun fetchFeed(kind: InAppMessage.Kind? = null, limit: Int? = null): List<InAppMessage> = mutex.withLock {
+    suspend fun fetchFeed(kind: InAppMessage.Kind? = null, limit: Int? = null): List<InAppMessage> =
+        fetchFeed(kind, limit, null)
+
+    /**
+     * Open messages or cards in the formats the caller renders. [formats] null means the native formats, so
+     * `html` messages arrive only when listed.
+     */
+    suspend fun fetchFeed(
+        kind: InAppMessage.Kind?,
+        limit: Int?,
+        formats: List<InAppMessage.Format>?,
+    ): List<InAppMessage> = mutex.withLock {
         val result = withIdentity { email, token ->
             post(
                 "/api/v1/in-app/feed",
@@ -625,6 +636,7 @@ class SequenzyCore(
                     put("identityToken", token)
                     kind?.let { put("kind", it.wire) }
                     limit?.let { put("limit", it) }
+                    formats?.let { list -> put("formats", JsonArray(list.map { JsonPrimitive(it.wire) })) }
                 },
             )
         }
@@ -641,7 +653,10 @@ class SequenzyCore(
     }
 
     /** Reports `displayed`, `clicked`, `dismissed` or `read` for a feed item. */
-    suspend fun report(type: InAppEventType, messageId: String): Boolean = mutex.withLock {
+    suspend fun report(type: InAppEventType, messageId: String): Boolean = report(type, messageId, null)
+
+    /** Like [report], with [buttonId] naming the control clicked in a custom HTML message. */
+    suspend fun report(type: InAppEventType, messageId: String, buttonId: String?): Boolean = mutex.withLock {
         val result = withIdentity { email, token ->
             post(
                 "/api/v1/in-app/feed/events",
@@ -652,6 +667,9 @@ class SequenzyCore(
                     put("identityToken", token)
                     put("messageId", messageId)
                     put("type", type.wire)
+                    if (buttonId != null && type == InAppEventType.CLICKED && InAppHtmlBridgeMessage.isValidButtonId(buttonId)) {
+                        put("buttonId", buttonId)
+                    }
                 },
             )
         }

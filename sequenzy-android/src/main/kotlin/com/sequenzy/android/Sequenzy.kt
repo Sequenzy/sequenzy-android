@@ -110,6 +110,20 @@ object Sequenzy {
     @JvmStatic
     var feedRefreshIntervalMs: Long = 60_000
 
+    /**
+     * Show custom HTML in-app messages (surveys, Braze-style custom HTML) in a sandboxed WebView. Set false
+     * before `configure` to leave them in the feed for another app or SDK version.
+     */
+    @JvmStatic
+    var showsHtmlMessages: Boolean = true
+
+    private val displayedFormats: List<InAppMessage.Format>
+        get() = if (showsHtmlMessages) {
+            InAppMessage.Format.entries.toList()
+        } else {
+            InAppMessage.Format.entries.filter { it != InAppMessage.Format.HTML }
+        }
+
     @JvmStatic
     val isConfigured: Boolean get() = core != null
 
@@ -161,6 +175,8 @@ object Sequenzy {
         val core = requireCore() ?: return
         enqueue {
             core.identify(email, identityToken)
+            val signedIn = core.email
+            withContext(Dispatchers.Main) { presenter?.signedIn(signedIn) }
             refreshMessages(force = true)
         }
     }
@@ -273,10 +289,18 @@ object Sequenzy {
 
     // region In-app
 
-    /** Open in-app messages, for apps that present them themselves. */
+    /** Open in-app messages, for apps that present them themselves. Custom HTML messages are left out. */
     @JvmStatic
-    suspend fun fetchMessages(): List<InAppMessage> =
-        (requireCore() ?: throw SequenzyException.NotIdentified()).fetchFeed(InAppMessage.Kind.MESSAGE)
+    suspend fun fetchMessages(): List<InAppMessage> = fetchMessages(includeHtml = false)
+
+    /** Open in-app messages, for apps that present them themselves; custom HTML ones too with [includeHtml]. */
+    @JvmStatic
+    suspend fun fetchMessages(includeHtml: Boolean): List<InAppMessage> =
+        (requireCore() ?: throw SequenzyException.NotIdentified()).fetchFeed(
+            InAppMessage.Kind.MESSAGE,
+            null,
+            if (includeHtml) InAppMessage.Format.entries.toList() else null,
+        )
 
     /** Content cards for an inbox or feed screen, pinned cards first. */
     @JvmStatic
@@ -305,8 +329,12 @@ object Sequenzy {
         // that ran a moment after it was scheduled.
         if (!force && now - lastFeedFetchAt < feedRefreshIntervalMs * 9 / 10) return
         lastFeedFetchAt = now
-        val messages = runCatching { core.fetchFeed(InAppMessage.Kind.MESSAGE) }.getOrNull() ?: return
-        withContext(Dispatchers.Main) { presenter?.enqueue(messages) }
+        val owner = core.email
+        val messages = runCatching {
+            core.fetchFeed(InAppMessage.Kind.MESSAGE, null, displayedFormats)
+        }.getOrNull() ?: return
+        if (core.email != owner) return
+        withContext(Dispatchers.Main) { presenter?.enqueue(messages, owner) }
     }
 
     // endregion
@@ -315,9 +343,12 @@ object Sequenzy {
 
     internal const val EXTRA_HANDLED = "com.sequenzy.handled"
 
-    internal fun reportFromPresenter(type: InAppEventType, messageId: String) {
+    /** The identified contact's email, as normalized by identify. */
+    internal val signedInEmail: String? get() = core?.email
+
+    internal fun reportFromPresenter(type: InAppEventType, messageId: String, buttonId: String? = null) {
         val core = core ?: return
-        scope.launch { core.report(type, messageId) }
+        scope.launch { core.report(type, messageId, buttonId) }
     }
 
     internal fun reportPush(type: PushEventType, payload: PushPayload) {
@@ -328,9 +359,13 @@ object Sequenzy {
     internal fun open(context: Context, url: Uri, message: InAppMessage?) {
         if (inAppListener?.handleUrl(url, message) == true) return
         val intent = Intent(Intent.ACTION_VIEW, url).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        // A deep link into this app should stay in the app's own task.
-        application?.packageName?.let { pkg ->
-            if (url.scheme != "http" && url.scheme != "https") intent.setPackage(pkg)
+        // A deep link into this app should stay in the app's own task; other
+        // schemes the app doesn't handle (mailto:, tel:) go to the system.
+        application?.let { app ->
+            if (url.scheme != "http" && url.scheme != "https") {
+                intent.setPackage(app.packageName)
+                if (intent.resolveActivity(app.packageManager) == null) intent.setPackage(null)
+            }
         }
         runCatching { context.startActivity(intent) }.onFailure {
             Log.e(TAG, "No activity can open $url")
