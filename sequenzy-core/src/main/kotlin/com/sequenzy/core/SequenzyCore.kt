@@ -17,6 +17,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import java.text.SimpleDateFormat
@@ -25,7 +26,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 
-const val SEQUENZY_SDK_VERSION = "0.1.1"
+const val SEQUENZY_SDK_VERSION = "0.1.2"
 
 data class SequenzyConfiguration(
     /** Publishable key (`seq_pk_...`) restricted to this app's package name. */
@@ -74,8 +75,11 @@ internal data class QueuedEvent(
     val eventId: String,
     val properties: JsonObject,
     val occurredAt: String,
-    /** `screen` or `commerce`; null for custom events. */
+    /** `screen`, `commerce` or `geofence`; null for custom events. */
     val type: String? = null,
+    /** `enter` or `exit`, for geofence events. */
+    val transition: String? = null,
+    val geofenceId: String? = null,
 ) {
     fun toJson(): JsonObject = buildJsonObject {
         type?.let { put("type", it) }
@@ -83,6 +87,8 @@ internal data class QueuedEvent(
         put("eventId", eventId)
         put("properties", properties)
         put("occurredAt", occurredAt)
+        transition?.let { put("transition", it) }
+        geofenceId?.let { put("geofenceId", it) }
     }
 }
 
@@ -105,6 +111,13 @@ class SequenzyCore(
     @Volatile var device: DeviceInfo = DeviceInfo(),
     @Volatile var identityTokenProvider: IdentityTokenProvider? = null,
     @Volatile var logLevel: LogLevel = LogLevel.ERROR,
+    /**
+     * Reads the OS notification permission, sent with every registration so
+     * the server knows who can see a push. Set by the Android layer.
+     */
+    @Volatile var pushPermissionReader: (() -> PushPermissionStatus?)? = null,
+    /** True when the app can ask for permission, so the feed includes push primers. */
+    @Volatile var handlesPushPermission: Boolean = false,
     private val logger: SequenzyLogger = SequenzyLogger { level, message -> println("[Sequenzy] $level: $message") },
     private val scope: CoroutineScope,
     private val now: () -> Long = System::currentTimeMillis,
@@ -127,6 +140,7 @@ class SequenzyCore(
         private const val KEY_PUSH_TOKEN = "pushToken"
         private const val KEY_PUSH_REGISTRATION = "pushRegistration"
         private const val KEY_PROFILE = "profile"
+        private const val KEY_GEOFENCE_TRANSITIONS = "geofenceTransitions"
 
         fun isRetryable(status: Int) = status == 0 || status == 408 || status == 425 || status == 429 || status >= 500
     }
@@ -172,6 +186,8 @@ class SequenzyCore(
             }
             store.putString(KEY_EMAIL, normalized)
             store.putString(KEY_IDENTITY_TOKEN, null)
+            // Another contact's recent geofence transitions must not suppress this one's.
+            store.putString(KEY_GEOFENCE_TRANSITIONS, null)
         }
         if (!identityToken.isNullOrEmpty()) store.putString(KEY_IDENTITY_TOKEN, identityToken)
         identityBlocked = false
@@ -198,6 +214,7 @@ class SequenzyCore(
         store.putString(KEY_PUSH_REGISTRATION, null)
         store.putString(KEY_ANONYMOUS_ID, UUID.randomUUID().toString())
         store.putString(KEY_PROFILE, null)
+        store.putString(KEY_GEOFENCE_TRANSITIONS, null)
         events.clear()
         persistEvents()
         retryJob?.cancel()
@@ -489,6 +506,8 @@ class SequenzyCore(
                     properties = obj["properties"] as? JsonObject ?: JsonObject(emptyMap()),
                     occurredAt = obj.string("occurredAt") ?: return@mapNotNull null,
                     type = obj.string("type"),
+                    transition = obj.string("transition"),
+                    geofenceId = obj.string("geofenceId"),
                 )
             }.toMutableList()
         }.getOrElse { mutableListOf() }
@@ -522,10 +541,12 @@ class SequenzyCore(
     private suspend fun registerPushLocked(force: Boolean) {
         val token = store.getString(KEY_PUSH_TOKEN) ?: return
         val identity = email ?: ""
+        val permission = runCatching { pushPermissionReader?.invoke() }.getOrNull()
         if (!force) {
             val last = parseObject(store.getString(KEY_PUSH_REGISTRATION))
             val lastAt = (last?.get("registeredAt") as? JsonPrimitive)?.longOrNull
             if (last != null && last.string("token") == token && last.string("email") == identity &&
+                (permission == null || last.string("permission") == permission.wire) &&
                 lastAt != null && now() - lastAt < PUSH_REFRESH_INTERVAL_MS
             ) {
                 return
@@ -538,6 +559,7 @@ class SequenzyCore(
             put("platform", configuration.platform)
             put("token", token)
             put("anonymousId", anonymousId)
+            permission?.let { put("permission", it.wire) }
             device.appVersion?.takeIf { it.isNotEmpty() }?.let { put("appVersion", it) }
             device.osVersion?.takeIf { it.isNotEmpty() }?.let { put("osVersion", it) }
             device.deviceName?.takeIf { it.isNotEmpty() }?.let { put("deviceName", it) }
@@ -579,6 +601,7 @@ class SequenzyCore(
                 put("token", token)
                 put("email", if (identified) identity else "")
                 put("registeredAt", now())
+                permission?.let { put("permission", it.wire) }
             }.toString(),
         )
         if ((parsed?.get("pushConfigured") as? JsonPrimitive)?.booleanOrNull == false) {
@@ -637,6 +660,10 @@ class SequenzyCore(
                     kind?.let { put("kind", it.wire) }
                     limit?.let { put("limit", it) }
                     formats?.let { list -> put("formats", JsonArray(list.map { JsonPrimitive(it.wire) })) }
+                    // Push primers come only when this app can ask for permission
+                    if (handlesPushPermission) {
+                        put("actions", JsonArray(listOf(JsonPrimitive(InAppButton.Action.REQUEST_PUSH_PERMISSION.wire))))
+                    }
                 },
             )
         }
@@ -655,8 +682,16 @@ class SequenzyCore(
     /** Reports `displayed`, `clicked`, `dismissed` or `read` for a feed item. */
     suspend fun report(type: InAppEventType, messageId: String): Boolean = report(type, messageId, null)
 
-    /** Like [report], with [buttonId] naming the control clicked in a custom HTML message. */
-    suspend fun report(type: InAppEventType, messageId: String, buttonId: String?): Boolean = mutex.withLock {
+    /**
+     * Like [report], with [buttonId] naming the control clicked in a custom HTML
+     * message. A push primer's click carries the permission read after asking.
+     */
+    suspend fun report(
+        type: InAppEventType,
+        messageId: String,
+        buttonId: String?,
+        pushPermission: PushPermissionStatus? = null,
+    ): Boolean = mutex.withLock {
         val result = withIdentity { email, token ->
             post(
                 "/api/v1/in-app/feed/events",
@@ -670,12 +705,106 @@ class SequenzyCore(
                     if (buttonId != null && type == InAppEventType.CLICKED && InAppHtmlBridgeMessage.isValidButtonId(buttonId)) {
                         put("buttonId", buttonId)
                     }
+                    pushPermission?.let { put("pushPermission", it.wire) }
                 },
             )
         }
         val ok = result is IdentifiedResult.Response && result.response.status in 200..299
         if (!ok) log(LogLevel.ERROR, "Could not report in-app ${type.wire} for $messageId")
         ok
+    }
+
+    // endregion
+
+    // region Geofences
+
+    /** The nearest active geofences around a position, rounded to two decimals here. */
+    suspend fun fetchNearbyGeofences(latitude: Double, longitude: Double, limit: Int): NearbyGeofences = mutex.withLock {
+        val result = withIdentity { email, token ->
+            post(
+                "/api/v1/geofences/nearby",
+                buildJsonObject {
+                    put("companyId", configuration.companyId)
+                    put("publicKey", configuration.publicKey)
+                    put("email", email)
+                    put("identityToken", token)
+                    put("latitude", Geofencing.roundCoordinate(latitude))
+                    put("longitude", Geofencing.roundCoordinate(longitude))
+                    put("limit", limit.coerceIn(1, 99))
+                },
+            )
+        }
+        when (result) {
+            is IdentifiedResult.NotIdentified -> throw SequenzyException.NotIdentified()
+            is IdentifiedResult.Rejected -> throw SequenzyException.IdentityRejected()
+            is IdentifiedResult.Failed -> throw result.error
+            is IdentifiedResult.Response -> {
+                val response = result.response
+                if (response.status !in 200..299) throw SequenzyException.Http(response.status, errorMessage(response.body))
+                NearbyGeofences.fromJson(json.parseToJsonElement(response.body))
+            }
+        }
+    }
+
+    /**
+     * Queues an enter or exit the OS reported for the identified contact. The
+     * refresh region, a repeat of the same transition within a minute and any
+     * transition while nobody is identified are ignored. Returns whether it was queued.
+     */
+    suspend fun trackGeofenceTransition(
+        geofenceId: String,
+        transition: GeofenceTransition,
+        atMillis: Long? = null,
+    ): Boolean = trackGeofenceTransitions(listOf(geofenceId), transition, atMillis) == 1
+
+    /**
+     * [trackGeofenceTransition] for several geofences the OS reported at once:
+     * all are queued and stored before anything is sent, so a slow network
+     * cannot cost the later ones. Returns how many were queued.
+     */
+    suspend fun trackGeofenceTransitions(
+        geofenceIds: List<String>,
+        transition: GeofenceTransition,
+        atMillis: Long? = null,
+    ): Int = mutex.withLock {
+        // Visits belong to a contact; never queue one for whoever signs in next.
+        if (email == null) return@withLock 0
+        val at = atMillis ?: now()
+        val recent = (parseObject(store.getString(KEY_GEOFENCE_TRANSITIONS)) ?: JsonObject(emptyMap()))
+            .mapValues { (_, value) -> value.jsonPrimitive.content.toLongOrNull() ?: 0L }
+            .toMutableMap()
+        var queued = 0
+        for (id in geofenceIds.map { it.trim() }.distinct()) {
+            if (id.isEmpty() || id == GeofenceRegion.REFRESH_REGION_ID) continue
+            val key = "$id:${transition.wire}"
+            if (Geofencing.isDuplicate(recent[key], at)) {
+                log(LogLevel.DEBUG, "Ignored repeated geofence ${transition.wire} for $id")
+                continue
+            }
+            recent[key] = at
+            events.add(
+                QueuedEvent(
+                    name = "geofence",
+                    eventId = UUID.randomUUID().toString(),
+                    properties = JsonObject(emptyMap()),
+                    occurredAt = formatIso8601(at),
+                    type = "geofence",
+                    transition = transition.wire,
+                    geofenceId = id,
+                ),
+            )
+            queued++
+        }
+        if (queued == 0) return@withLock 0
+        val cutoff = now() - MAX_EVENT_AGE_MS
+        store.putString(
+            KEY_GEOFENCE_TRANSITIONS,
+            buildJsonObject { recent.filterValues { it > cutoff }.forEach { (k, v) -> put(k, v) } }.toString(),
+        )
+        while (events.size > MAX_QUEUED_EVENTS) events.removeAt(0)
+        persistEvents()
+        flushLocked()
+        queued
     }
 
     // endregion

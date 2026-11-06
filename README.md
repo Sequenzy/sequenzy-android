@@ -10,7 +10,7 @@ Full guide: [Mobile SDKs](https://docs.sequenzy.com/concepts/mobile-sdks).
 
 ```kotlin
 dependencies {
-    implementation("com.sequenzy:sequenzy-android:0.1.1")
+    implementation("com.sequenzy:sequenzy-android:0.1.2")
     implementation("com.google.firebase:firebase-messaging:24.1.0") // for push
 }
 ```
@@ -44,11 +44,37 @@ notifications are reported when they open your app. Apps with their own
 `FirebaseMessagingService` call `SequenzyMessagingService.handleNewToken` and
 `handleMessage` from it. The identity token provider should suspend (for example with a suspending
 HTTP client) rather than block a thread: the SDK times it out after 20 seconds
-only at suspension points. Ask for `POST_NOTIFICATIONS` on Android 13+. With a `singleTop` or
+only at suspension points. Ask for notification permission on Android 13+ with
+`Sequenzy.requestPushPermission()` (it prompts, or opens the notification
+settings when they were turned off); push primers, in-app messages with an
+"Asks for push" button, ask through the same flow, and registrations carry the
+permission. With a `singleTop` or
 `singleTask` launcher activity, call `Sequenzy.handleIntent(this, intent)` from
 `onNewIntent`. Set
 `Sequenzy.inAppListener` to veto messages or open links yourself, and
 `Sequenzy.notificationIcon` for the small icon.
+
+## Geofencing
+
+`com.sequenzy:sequenzy-android-geofences` reports when the signed-in contact
+enters or leaves your [geofences](https://docs.sequenzy.com/concepts/geofences),
+with Google Play services location. It is a separate artifact so apps without
+geofencing never pull in location code.
+
+```kotlin
+// Application.onCreate, after Sequenzy.configure(...)
+SequenzyGeofences.start(this)
+// once the user agreed and granted fine and background location
+SequenzyGeofences.enable(context)
+SequenzyGeofences.disable(context)   // consent withdrawn
+```
+
+The app declares and requests `ACCESS_FINE_LOCATION` and, on Android 10+,
+`ACCESS_BACKGROUND_LOCATION` (Google Play asks apps that use it for a
+declaration). Only identified contacts are tracked. The SDK registers the 49
+nearest geofences plus one region around the device (lower `maxRegions` if the
+app registers its own), fetches again when the device leaves it, and
+re-registers after a reboot or app update.
 
 ## Custom HTML messages
 
@@ -68,6 +94,7 @@ consumer ProGuard rules keep the bridge when your app is minified.
 | ------------------ | ------------------------------------------------------------ |
 | `sequenzy-core`    | Protocol client, identity, event queue, payload parsing. Plain Kotlin/JVM. |
 | `sequenzy-android` | Facade, SharedPreferences store, FCM service, notifications, in-app presenter |
+| `sequenzy-android-geofences` | Geofence monitoring with Google Play services location |
 | `example`          | One-screen app                                               |
 
 ## Develop

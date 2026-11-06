@@ -25,5 +25,13 @@
             android:noHistory="true"
             android:taskAffinity=""
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Invisible activity that shows the notification permission prompt
+             for push primers (Android 13+) and finishes. -->
+        <activity
+            android:name="com.sequenzy.android.SequenzyPermissionActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 </manifest>

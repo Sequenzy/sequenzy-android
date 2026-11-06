@@ -26,5 +26,13 @@ val hasAndroidSdk = System.getenv("ANDROID_HOME") != null ||
     (localProperties.exists() && localProperties.readText().contains("sdk.dir"))
 if (hasAndroidSdk) {
     include(":sequenzy-android")
+    include(":sequenzy-android-geofences")
+    // The native half of the Flutter and React Native geofence plugins. It
+    // lives next to this folder, so the public sequenzy-android copy has none.
+    val geofenceBridge = file("../geofence-bridge/android")
+    if (geofenceBridge.exists()) {
+        include(":sequenzy-geofence-bridge")
+        project(":sequenzy-geofence-bridge").projectDir = geofenceBridge
+    }
     include(":example")
 }

@@ -508,7 +508,7 @@ internal class MessageViews(
         val palette = Palette.surface(tones)
         val top = message.resolvedPosition == InAppMessage.Position.TOP
         val direction = if (top) -1f else 1f
-        val link = splitButtons(message.buttons).first?.takeIf { it.action == InAppButton.Action.OPEN_URL }
+        val link = splitButtons(message.buttons).first?.takeIf { it.acts }
 
         val row = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -680,7 +680,7 @@ internal class MessageViews(
         )
         secondary?.let { button ->
             addView(
-                label(button.label, 17f, 22f, Typeface.BOLD, if (button.action == InAppButton.Action.OPEN_URL) palette.secondaryLink else palette.secondaryDismiss).apply {
+                label(button.label, 17f, 22f, Typeface.BOLD, if (button.acts) palette.secondaryLink else palette.secondaryDismiss).apply {
                     gravity = Gravity.CENTER
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
@@ -776,9 +776,9 @@ internal class MessageViews(
     }
 }
 
-/** The primary button (first link, or first button) and the other one. */
+/** The primary button (first that acts: a link or push permission; else the first) and the other one. */
 internal fun splitButtons(buttons: List<InAppButton>): Pair<InAppButton?, InAppButton?> {
-    val index = buttons.indexOfFirst { it.action == InAppButton.Action.OPEN_URL }
+    val index = buttons.indexOfFirst { it.acts }
     val primaryIndex = if (index == -1) 0 else index
     val primary = buttons.getOrNull(primaryIndex)
     val secondary = buttons.filterIndexed { i, _ -> i != primaryIndex }.firstOrNull()

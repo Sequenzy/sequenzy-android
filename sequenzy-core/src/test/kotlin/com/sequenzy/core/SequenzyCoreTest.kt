@@ -166,7 +166,10 @@ class SequenzyCoreTest {
 
         val messages = client.fetchFeed(InAppMessage.Kind.MESSAGE)
         assertMatchesContract(transport.to("/api/v1/in-app/feed").last(), "fetchFeed")
-        assertEquals(listOf("iam_modal", "iam_banner", "iam_card"), messages.map { it.id })
+        assertEquals(listOf("iam_modal", "iam_banner", "iam_primer", "iam_card"), messages.map { it.id })
+        assertEquals(InAppButton.Action.REQUEST_PUSH_PERMISSION, messages[2].buttons[0].action)
+        assertTrue(messages[2].buttons[0].acts)
+        assertTrue(!messages[2].buttons[1].acts)
         assertEquals(InAppMessage.Format.MODAL, messages[0].resolvedFormat)
         assertEquals(InAppButton("Upgrade", InAppButton.Action.OPEN_URL, "myapp://billing"), messages[0].buttons[0])
         assertEquals(InAppButton.Action.DISMISS, messages[0].buttons[1].action)
@@ -175,8 +178,8 @@ class SequenzyCoreTest {
         assertEquals(16.0, messages[0].style.cornerRadius)
         assertEquals(mapOf("campaign" to "trial"), messages[0].data)
         assertEquals(InAppMessage.Position.TOP, messages[1].resolvedPosition)
-        assertEquals(InAppMessage.Kind.CARD, messages[2].kind)
-        assertTrue(messages[2].pinned)
+        assertEquals(InAppMessage.Kind.CARD, messages[3].kind)
+        assertTrue(messages[3].pinned)
 
         assertTrue(client.report(InAppEventType.DISPLAYED, "iam_modal"))
         assertMatchesContract(transport.requests.last(), "reportInAppEvent")
@@ -574,6 +577,44 @@ class SequenzyCoreTest {
             Json.parseToJsonElement("""{"id":"m","kind":"message","format":"modal","position":"center"}"""),
         )
         assertEquals(InAppMessage.Position.CENTER, centered?.position)
+    }
+
+    @Test
+    fun `sends the push permission with registrations and registers again when it changes`() = runBlocking {
+        var permission = PushPermissionStatus.DENIED
+        val client = client()
+        client.pushPermissionReader = { permission }
+        client.identify(email, identityToken)
+        client.setPushToken(Contract.token)
+        assertMatchesContract(transport.to("/api/v1/push/app-devices").last(), "registerDeviceWithPermission")
+        val count = transport.to("/api/v1/push/app-devices").size
+        client.registerPushIfNeeded()
+        assertEquals(count, transport.to("/api/v1/push/app-devices").size)
+        permission = PushPermissionStatus.GRANTED
+        client.registerPushIfNeeded()
+        assertEquals(count + 1, transport.to("/api/v1/push/app-devices").size)
+        assertEquals("granted", transport.to("/api/v1/push/app-devices").last().json()["permission"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `asks for push primers only when the app can ask for permission`() = runBlocking {
+        transport.respond("/api/v1/in-app/feed", 200, """{"success":true,"messages":[]}""")
+        val client = client()
+        client.identify(email, identityToken)
+        client.fetchFeed(InAppMessage.Kind.MESSAGE)
+        assertMatchesContract(transport.to("/api/v1/in-app/feed").last(), "fetchFeed")
+        assertNull(transport.to("/api/v1/in-app/feed").last().json()["actions"])
+        client.handlesPushPermission = true
+        client.fetchFeed(InAppMessage.Kind.MESSAGE)
+        assertMatchesContract(transport.to("/api/v1/in-app/feed").last(), "fetchFeedWithPushPrimers")
+    }
+
+    @Test
+    fun `reports a push primer click with the permission`() = runBlocking {
+        val client = client()
+        client.identify(email, identityToken)
+        assertTrue(client.report(InAppEventType.CLICKED, "iam_primer", buttonId = null, pushPermission = PushPermissionStatus.GRANTED))
+        assertMatchesContract(transport.requests.last(), "reportPushPrimerClicked")
     }
 }
 

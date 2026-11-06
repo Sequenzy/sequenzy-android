@@ -116,9 +116,15 @@ internal class InAppPresenter {
         when (outcome) {
             is Outcome.Dismissed -> Sequenzy.reportFromPresenter(InAppEventType.DISMISSED, message.id)
             is Outcome.Tapped -> {
-                Sequenzy.reportFromPresenter(InAppEventType.CLICKED, message.id)
-                val url = outcome.button?.url ?: message.buttons.firstOrNull { it.action == InAppButton.Action.OPEN_URL }?.url
-                url?.let { Sequenzy.open(activity, Uri.parse(it), message) }
+                // A banner tap (null button) acts like its primary button
+                val target = outcome.button ?: message.buttons.firstOrNull { it.acts }
+                if (target?.action == InAppButton.Action.REQUEST_PUSH_PERMISSION) {
+                    Sequenzy.requestPermissionAndReport(message.id)
+                } else {
+                    Sequenzy.reportFromPresenter(InAppEventType.CLICKED, message.id)
+                    val url = target?.url ?: message.buttons.firstOrNull { it.action == InAppButton.Action.OPEN_URL }?.url
+                    url?.let { Sequenzy.open(activity, Uri.parse(it), message) }
+                }
             }
         }
         hide()
@@ -156,7 +162,7 @@ internal class InAppPresenter {
     sealed class Outcome {
         data object Dismissed : Outcome()
 
-        /** A link button, or the banner itself (null button). */
+        /** A link or push permission button, or the banner itself (null button). */
         data class Tapped(val button: InAppButton?) : Outcome()
     }
 }

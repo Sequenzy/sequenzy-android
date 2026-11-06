@@ -18,14 +18,17 @@ import com.sequenzy.core.CommerceCartLine
 import com.sequenzy.core.CommerceCollection
 import com.sequenzy.core.CommerceProduct
 import com.sequenzy.core.DeviceInfo
+import com.sequenzy.core.GeofenceTransition
 import com.sequenzy.core.IdentityTokenProvider
 import com.sequenzy.core.InAppButton
 import com.sequenzy.core.InAppEventType
 import com.sequenzy.core.InAppMessage
 import com.sequenzy.core.LogLevel
+import com.sequenzy.core.NearbyGeofences
 import com.sequenzy.core.ProfileUpdate
 import com.sequenzy.core.PushEventType
 import com.sequenzy.core.PushPayload
+import com.sequenzy.core.PushPermissionStatus
 import com.sequenzy.core.SequenzyConfiguration
 import com.sequenzy.core.SequenzyCore
 import com.sequenzy.core.SequenzyException
@@ -160,6 +163,8 @@ object Sequenzy {
                 if (level == LogLevel.ERROR) Log.e(TAG, message) else Log.i(TAG, message)
             },
             scope = scope,
+            pushPermissionReader = { PushPermissions.status(application) },
+            handlesPushPermission = true,
         )
         presenter = InAppPresenter()
         application.registerActivityLifecycleCallbacks(ActivityTracker)
@@ -285,6 +290,32 @@ object Sequenzy {
         return true
     }
 
+    /** The notification permission as Android reports it now. */
+    @JvmStatic
+    fun pushPermissionStatus(): PushPermissionStatus? = application?.let { PushPermissions.status(it) }
+
+    /**
+     * Asks for notification permission, as a push primer does: the system
+     * prompt on Android 13+ when Android still shows it, otherwise the app's
+     * notification settings. Returns the permission afterwards and registers
+     * the device again so Sequenzy knows.
+     */
+    suspend fun requestPushPermission(): PushPermissionStatus? {
+        val app = application ?: return null
+        val status = PushPermissions.request(app, resumedActivity)
+        core?.let { core -> enqueue { core.registerPushIfNeeded() } }
+        return status
+    }
+
+    /** [requestPushPermission] for Java callers; [callback] runs on the main thread. */
+    @JvmStatic
+    fun requestPushPermission(callback: (PushPermissionStatus?) -> Unit) {
+        scope.launch {
+            val status = requestPushPermission()
+            withContext(Dispatchers.Main) { callback(status) }
+        }
+    }
+
     // endregion
 
     // region In-app
@@ -314,12 +345,62 @@ object Sequenzy {
         scope.launch { core.report(type, message.id) }
     }
 
-    /** Reports the click and opens the button's URL. */
+    /**
+     * Reports the click and performs the button's action: opens its URL, or
+     * asks for push permission and reports the result with the click.
+     */
     @JvmStatic
     fun handleButtonClick(context: Context, button: InAppButton, message: InAppMessage) {
+        if (button.action == InAppButton.Action.REQUEST_PUSH_PERMISSION) {
+            requestPermissionAndReport(message.id)
+            return
+        }
         report(InAppEventType.CLICKED, message)
         if (button.action == InAppButton.Action.OPEN_URL) button.url?.let { open(context, Uri.parse(it), message) }
     }
+
+    internal fun requestPermissionAndReport(messageId: String) {
+        val core = requireCore() ?: return
+        scope.launch {
+            val status = requestPushPermission()
+            core.report(InAppEventType.CLICKED, messageId, buttonId = null, pushPermission = status)
+        }
+    }
+
+    /** The identified contact's email, or null. Geofencing runs only then. */
+    @JvmStatic
+    fun identifiedEmail(): String? = core?.email
+
+    /**
+     * The nearest geofences around a position, rounded to about 1 km before it
+     * is sent. `SequenzyGeofences` calls this; apps with their own location
+     * stack can too.
+     */
+    @JvmStatic
+    suspend fun fetchNearbyGeofences(latitude: Double, longitude: Double, limit: Int): NearbyGeofences =
+        (requireCore() ?: throw SequenzyException.NotIdentified()).fetchNearbyGeofences(latitude, longitude, limit)
+
+    /**
+     * Reports a geofence enter or exit and returns once it is sent or queued,
+     * for apps with their own geofencing; `SequenzyGeofences` calls it too.
+     */
+    @JvmStatic
+    suspend fun trackGeofenceTransition(
+        geofenceId: String,
+        transition: GeofenceTransition,
+        atMillis: Long? = null,
+    ): Boolean = requireCore()?.trackGeofenceTransition(geofenceId, transition, atMillis) ?: false
+
+    /**
+     * [trackGeofenceTransition] for several geofences reported at once: all are
+     * stored before anything is sent. Returns how many were queued.
+     */
+    @JvmStatic
+    suspend fun trackGeofenceTransitions(
+        geofenceIds: List<String>,
+        transition: GeofenceTransition,
+        atMillis: Long? = null,
+    ): Int = requireCore()?.trackGeofenceTransitions(geofenceIds, transition, atMillis) ?: 0
 
     internal suspend fun refreshMessages(force: Boolean = false) {
         val core = core ?: return

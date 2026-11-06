@@ -90,7 +90,15 @@ data class InAppMessage @JvmOverloads constructor(
 }
 
 data class InAppButton(val label: String, val action: Action, val url: String?) {
-    enum class Action(val wire: String) { OPEN_URL("open_url"), DISMISS("dismiss") }
+    /** [REQUEST_PUSH_PERMISSION]: a push primer button that asks for notification permission. */
+    enum class Action(val wire: String) {
+        OPEN_URL("open_url"),
+        DISMISS("dismiss"),
+        REQUEST_PUSH_PERMISSION("request_push_permission"),
+    }
+
+    /** Opens a link or asks for push permission, rather than closing. */
+    val acts: Boolean get() = action != Action.DISMISS
 
     companion object {
         fun fromJson(element: JsonElement): InAppButton? {
@@ -154,3 +162,15 @@ fun parseHexColor(hex: String): Int? {
 
 internal fun JsonObject.string(key: String): String? =
     (this[key] as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
+
+/**
+ * The OS notification permission. [PROVISIONAL] and [EPHEMERAL] are iOS-only;
+ * Android reports [GRANTED], [DENIED] or [NOT_DETERMINED].
+ */
+enum class PushPermissionStatus(val wire: String) {
+    GRANTED("granted"),
+    PROVISIONAL("provisional"),
+    EPHEMERAL("ephemeral"),
+    DENIED("denied"),
+    NOT_DETERMINED("not_determined"),
+}
