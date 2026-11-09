@@ -6,3 +6,7 @@
 -keepclassmembers class com.sequenzy.android.InAppHtmlDialog$Bridge {
     @android.webkit.JavascriptInterface <methods>;
 }
+# Android 16 Live Updates use Notification.ProgressStyle behind an API 36
+# check; apps that compile against an older SDK must still shrink.
+-dontwarn android.app.Notification$ProgressStyle
+-dontwarn android.app.Notification$ProgressStyle$**

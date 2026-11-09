@@ -169,7 +169,7 @@ object SequenzyGeofences {
 
     @SuppressLint("MissingPermission")
     private suspend fun fetchAndApply(context: Context) {
-        if (Sequenzy.identifiedEmail() == null) {
+        if (Sequenzy.identifiedContact() == null) {
             // Visits are recorded on a contact; nobody is signed in.
             apply(context, emptyList())
             return

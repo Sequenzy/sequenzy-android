@@ -6,12 +6,13 @@ plugins {
     kotlin("android") version "2.0.21" apply false
     id("com.android.library") version "8.7.3" apply false
     id("com.android.application") version "8.7.3" apply false
+    id("com.google.gms.google-services") version "4.4.2" apply false
     id("com.vanniktech.maven.publish") version "0.30.0" apply false
 }
 
 allprojects {
     group = "com.sequenzy"
-    version = "0.1.2"
+    version = "0.1.3"
 }
 
 // Maven Central metadata shared by sequenzy-core and sequenzy-android. The

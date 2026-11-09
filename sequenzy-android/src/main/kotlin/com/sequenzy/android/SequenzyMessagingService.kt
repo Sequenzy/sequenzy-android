@@ -29,10 +29,12 @@ open class SequenzyMessagingService : FirebaseMessagingService() {
          * Shows a Sequenzy push that arrived while the app was in the
          * foreground and reports it delivered. While the app is in the
          * background Android shows the notification itself and the tap is
-         * reported when the app opens. Returns false for other senders.
+         * reported when the app opens. Live Updates are shown or updated
+         * in both cases. Returns false for other senders.
          */
         @JvmStatic
         fun handleMessage(service: FirebaseMessagingService, message: RemoteMessage): Boolean {
+            if (SequenzyLiveUpdates.handleMessage(service, message.data)) return true
             val payload = PushPayload.fromData(message.data) ?: return false
             Sequenzy.reportPush(PushEventType.DELIVERED, payload)
             NotificationDisplay.show(service, payload)

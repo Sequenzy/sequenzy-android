@@ -186,6 +186,56 @@ class SequenzyCoreTest {
     }
 
     @Test
+    fun `placements match the contract`() = runBlocking {
+        transport.respond("/api/v1/in-app/feed/placements", 200, Contract.text("placements-response.json"))
+        val client = client()
+        client.identify(email, identityToken)
+
+        val placements = client.fetchPlacements(listOf("home_hero", "checkout_upsell", "home_hero"))
+        assertMatchesContract(transport.to("/api/v1/in-app/feed/placements").last(), "fetchPlacements")
+        val hero = placements.getValue("home_hero")
+        assertEquals("iam_placement", hero.id)
+        assertEquals(InAppMessage.Kind.CARD, hero.kind)
+        assertTrue(hero.isPlacement)
+        assertEquals("home_hero", hero.placement)
+        assertEquals(InAppMessage.PlacementLayout.CARD, hero.layout)
+        assertNull(placements["checkout_upsell"])
+        assertTrue(client.fetchPlacements(listOf(" ")).isEmpty())
+
+        assertTrue(client.report(InAppEventType.DISPLAYED, "iam_placement"))
+        assertMatchesContract(transport.requests.last(), "reportPlacementDisplayed")
+    }
+
+    @Test
+    fun `placement layouts decode, and unknown ones read as card`() {
+        val body = Contract.text("placements-response.json")
+        for ((wire, expected) in listOf(
+            "banner" to InAppMessage.PlacementLayout.BANNER,
+            "hero" to InAppMessage.PlacementLayout.HERO,
+            "carousel" to InAppMessage.PlacementLayout.CARD,
+        )) {
+            val items = InAppMessage.mapFromPlacements(
+                kotlinx.serialization.json.Json.parseToJsonElement(
+                    body.replace("\"layout\": \"card\"", "\"layout\": \"$wire\""),
+                ),
+                listOf("home_hero"),
+            )
+            assertEquals(expected, items.getValue("home_hero").layout)
+        }
+    }
+
+    @Test
+    fun `a malformed placement item empties only its own slot`() {
+        val body = Contract.text("placements-response.json").replace("\"message\": null", "\"message\": {\"id\": 1}")
+        val items = InAppMessage.mapFromPlacements(
+            kotlinx.serialization.json.Json.parseToJsonElement(body),
+            listOf("home_hero", "checkout_upsell"),
+        )
+        assertEquals(setOf("home_hero"), items.keys)
+        assertTrue(InAppMessage.mapFromPlacements(kotlinx.serialization.json.JsonNull, listOf("home_hero")).isEmpty())
+    }
+
+    @Test
     fun `reset unregisters the device and forgets the user`() = runBlocking {
         val client = client()
         client.setPushToken(Contract.token)
@@ -640,3 +690,128 @@ private fun normalize(element: JsonElement): JsonElement = when (element) {
     else -> element
 }
 
+
+class IdentifyUserTest {
+    private lateinit var transport: FakeTransport
+    private lateinit var scope: CoroutineScope
+    private val identityToken = "seq_wid_contract.token"
+
+    @BeforeTest
+    fun setUp() {
+        transport = FakeTransport()
+        scope = CoroutineScope(Dispatchers.Default + Job())
+    }
+
+    @AfterTest
+    fun tearDown() = scope.cancel()
+
+    private fun client(
+        provider: IdentityTokenProvider? = null,
+        userProvider: UserIdentityTokenProvider? = null,
+    ) = SequenzyCore(
+        configuration = SequenzyConfiguration(
+            publicKey = Contract.config["publicKey"]!!.jsonPrimitive.content,
+            companyId = Contract.config["companyId"]!!.jsonPrimitive.content,
+            appId = Contract.config["appId"]!!.jsonPrimitive.content,
+            apiBaseUrl = Contract.config["apiBaseUrl"]!!.jsonPrimitive.content,
+            platform = "android",
+        ),
+        transport = transport,
+        store = InMemoryStore(),
+        identityTokenProvider = provider,
+        logLevel = LogLevel.NONE,
+        scope = scope,
+        userIdentityTokenProvider = userProvider,
+    )
+
+    @Test
+    fun `sends the external ID without an email`() = runBlocking {
+        val client = client()
+        client.track("opened")
+        client.identifyUser(" user_123 ", identityToken = identityToken)
+        val body = transport.to("/api/v1/app-events").last().json()
+        assertEquals("user_123", body["externalId"]?.jsonPrimitive?.content)
+        assertNull(body["email"])
+        assertEquals(identityToken, body["identityToken"]?.jsonPrimitive?.content)
+        assertEquals("user_123", client.externalId)
+        assertNull(client.email)
+        assertEquals("external user_123", client.contactKey)
+    }
+
+    @Test
+    fun `sends both identifiers when the user has an email`() = runBlocking {
+        val client = client()
+        client.identifyUser("user_123", email = "Jane@Example.com", identityToken = identityToken)
+        client.track("opened")
+        val body = transport.to("/api/v1/app-events").last().json()
+        assertEquals("user_123", body["externalId"]?.jsonPrimitive?.content)
+        assertEquals("jane@example.com", body["email"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `asks the user provider, never the email one, for external IDs`() = runBlocking {
+        var emailCalls = 0
+        val userCalls = mutableListOf<String>()
+        val client = client(
+            provider = { emailCalls++; "seq_wid_email.token" },
+            userProvider = { externalId, email -> userCalls.add("$externalId|$email"); "seq_wid_user.$externalId" },
+        )
+        client.identifyUser("user_123")
+        client.track("opened")
+        assertEquals(listOf("user_123|null"), userCalls)
+        assertEquals(0, emailCalls)
+        assertEquals(
+            "seq_wid_user.user_123",
+            transport.to("/api/v1/app-events").last().json()["identityToken"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun `another user ID drops the previous user's queue`() = runBlocking {
+        val client = client()
+        client.identifyUser("user_1")
+        client.track("for_user_1")
+        assertEquals(1, client.queuedEventCount())
+        client.identifyUser("user_2", identityToken = identityToken)
+        assertEquals(0, client.queuedEventCount())
+    }
+
+    @Test
+    fun `rejects an empty or overlong user ID`() = runBlocking {
+        val client = client()
+        client.identifyUser("   ", identityToken = identityToken)
+        client.identifyUser("x".repeat(256), identityToken = identityToken)
+        assertNull(client.externalId)
+    }
+
+    @Test
+    fun `treats a blank email as absent`() = runBlocking {
+        val client = client()
+        client.identifyUser("user_123", email = "   ", identityToken = identityToken)
+        assertEquals("user_123", client.externalId)
+        assertNull(client.email)
+    }
+
+    @Test
+    fun `adding an email to the same user keeps the queue but drops the token`() = runBlocking {
+        val client = client()
+        client.identifyUser("user_1")
+        client.track("queued")
+        client.identifyUser("user_1", email = "jane@example.com")
+        assertEquals(1, client.queuedEventCount())
+        assertEquals("jane@example.com", client.email)
+        client.identifyUser("user_1", email = "jane@example.com", identityToken = identityToken)
+        val body = transport.to("/api/v1/app-events").last().json()
+        assertEquals("jane@example.com", body["email"]?.jsonPrimitive?.content)
+        assertEquals(0, client.queuedEventCount())
+    }
+
+    @Test
+    fun `reset forgets the external ID`() = runBlocking {
+        val client = client()
+        client.identifyUser("user_123", identityToken = identityToken)
+        client.reset()
+        assertNull(client.externalId)
+        assertNull(client.contactKey)
+    }
+}

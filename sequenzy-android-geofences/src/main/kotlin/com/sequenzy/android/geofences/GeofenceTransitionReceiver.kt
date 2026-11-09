@@ -67,7 +67,7 @@ class GeofenceTransitionReceiver : BroadcastReceiver() {
         }
         val known = SequenzyGeofences.registered(context).map { it.id }.toSet()
         val report = ids.filter { it != GeofenceRegion.REFRESH_REGION_ID && it in known }
-        if (replan == null && (report.isEmpty() || Sequenzy.identifiedEmail() == null)) return
+        if (replan == null && (report.isEmpty() || Sequenzy.identifiedContact() == null)) return
 
         val at = event.triggeringLocation?.time?.takeIf { it > 0 } ?: System.currentTimeMillis()
         // Every transition is stored before anything is sent; sending that

@@ -11,7 +11,10 @@ import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 
-/** An item in the contact's in-app feed: a message shown over the app, or a content card. */
+/**
+ * An item in the contact's in-app feed: a message shown over the app, a content card, or a placement item drawn
+ * inline in a placement slot.
+ */
 data class InAppMessage @JvmOverloads constructor(
     val id: String,
     val kind: Kind,
@@ -37,7 +40,12 @@ data class InAppMessage @JvmOverloads constructor(
     val html: String? = null,
     /** `HTML` messages: draw a close button over the document. */
     val showCloseButton: Boolean = false,
+    /** Placement items: the placement key they fill. */
+    val placement: String? = null,
+    /** Placement items: card, banner or hero; [PlacementLayout.CARD] for other kinds and unknown values. */
+    val layout: PlacementLayout = PlacementLayout.CARD,
 ) {
+    /** Placement items read as [CARD] with a [placement] key ([isPlacement]), so exhaustive `when`s keep compiling. */
     enum class Kind(val wire: String) { MESSAGE("message"), CARD("card") }
 
     /** `HTML`: a custom HTML message rendered in a sandboxed WebView (see [InAppHtmlBridgeMessage]). */
@@ -47,16 +55,23 @@ data class InAppMessage @JvmOverloads constructor(
     enum class Position(val wire: String) { TOP("top"), BOTTOM("bottom"), CENTER("center") }
     enum class ImagePlacement(val wire: String) { TOP("top"), BACKGROUND("background") }
 
+    /** How a placement item is drawn in its slot (mobile-sdks/DESIGN.md). */
+    enum class PlacementLayout(val wire: String) { CARD("card"), BANNER("banner"), HERO("hero") }
+
     /** Messages default to a modal; banners and modals default to the bottom. */
     val resolvedFormat: Format get() = format ?: Format.MODAL
     val resolvedPosition: Position get() = position ?: Position.BOTTOM
     val isRead: Boolean get() = readAt != null
 
+    /** Drawn inline in a placement slot ([placement] set), never in the feed. */
+    val isPlacement: Boolean get() = placement != null
+
     companion object {
         fun fromJson(element: JsonElement): InAppMessage? {
             val obj = element as? JsonObject ?: return null
             val id = obj.string("id") ?: return null
-            val kind = Kind.entries.firstOrNull { it.wire == obj.string("kind") } ?: return null
+            val wire = obj.string("kind")
+            val kind = if (wire == "placement") Kind.CARD else Kind.entries.firstOrNull { it.wire == wire } ?: return null
             return InAppMessage(
                 id = id,
                 kind = kind,
@@ -80,7 +95,25 @@ data class InAppMessage @JvmOverloads constructor(
                 imagePlacement = ImagePlacement.entries.firstOrNull { it.wire == obj.string("imagePlacement") },
                 html = obj.string("html"),
                 showCloseButton = (obj["showCloseButton"] as? JsonPrimitive)?.booleanOrNull ?: false,
+                placement = obj.string("placement"),
+                layout = PlacementLayout.entries.firstOrNull { it.wire == obj.string("layout") } ?: PlacementLayout.CARD,
             )
+        }
+
+        /**
+         * Parses a `{ "placements": [{ placement, message }] }` response into the items that have something to show,
+         * by placement key. A malformed item empties only its own slot.
+         */
+        fun mapFromPlacements(element: JsonElement, requested: Collection<String>): Map<String, InAppMessage> {
+            val entries = (element as? JsonObject)?.get("placements") as? JsonArray ?: return emptyMap()
+            val items = LinkedHashMap<String, InAppMessage>()
+            for (entry in entries) {
+                val obj = entry as? JsonObject ?: continue
+                val key = obj.string("placement") ?: continue
+                if (key !in requested) continue
+                obj["message"]?.let(::fromJson)?.let { items[key] = it }
+            }
+            return items
         }
 
         /** Parses a `{ "messages": [...] }` feed response, skipping malformed items. */

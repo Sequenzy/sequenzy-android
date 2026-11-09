@@ -23,10 +23,10 @@ internal class InAppPresenter {
     private var owner: String? = null
 
     /** After identify: another contact's messages go before they can act for the new one. */
-    fun signedIn(email: String?) {
-        if (email == owner) return
+    fun signedIn(contact: String?) {
+        if (contact == owner) return
         dismissAll()
-        owner = email
+        owner = contact
     }
 
     fun enqueue(messages: List<InAppMessage>, owner: String?) {
@@ -95,7 +95,7 @@ internal class InAppPresenter {
                 message,
                 onLoaded = { Sequenzy.reportFromPresenter(InAppEventType.DISPLAYED, message.id) },
                 onFinish = { outcome -> finishHtml(activity, message, outcome) },
-                isForSignedInContact = { Sequenzy.signedInEmail == owner },
+                isForSignedInContact = { Sequenzy.signedInContact == owner },
             )
             htmlDialog = html
             html.show()
@@ -134,7 +134,7 @@ internal class InAppPresenter {
     private fun finishHtml(activity: Activity, message: InAppMessage, outcome: InAppHtmlDialog.Outcome) {
         if (current?.id != message.id) return
         htmlDialog = null
-        val forOwner = Sequenzy.signedInEmail == owner
+        val forOwner = Sequenzy.signedInContact == owner
         when (outcome) {
             is InAppHtmlDialog.Outcome.Dismissed ->
                 if (forOwner) Sequenzy.reportFromPresenter(InAppEventType.DISMISSED, message.id)

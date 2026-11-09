@@ -26,7 +26,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
 
-const val SEQUENZY_SDK_VERSION = "0.1.2"
+const val SEQUENZY_SDK_VERSION = "0.1.3"
 
 data class SequenzyConfiguration(
     /** Publishable key (`seq_pk_...`) restricted to this app's package name. */
@@ -58,6 +58,15 @@ fun interface IdentityTokenProvider {
     suspend fun fetchIdentityToken(email: String): String
 }
 
+/**
+ * Asks the host app's backend for a fresh identity token for a user
+ * identified with `identifyUser`: mint it for [externalId], plus [email] when
+ * it is set.
+ */
+fun interface UserIdentityTokenProvider {
+    suspend fun fetchIdentityToken(externalId: String, email: String?): String
+}
+
 enum class LogLevel { NONE, ERROR, INFO, DEBUG }
 
 fun interface SequenzyLogger {
@@ -65,7 +74,7 @@ fun interface SequenzyLogger {
 }
 
 sealed class SequenzyException(message: String) : Exception(message) {
-    class NotIdentified : SequenzyException("Call identify(email, identityToken) first")
+    class NotIdentified : SequenzyException("Call identify or identifyUser with an identity token first")
     class IdentityRejected : SequenzyException("The identity token was rejected")
     class Http(val status: Int, message: String?) : SequenzyException("HTTP $status ${message ?: ""}".trim())
 }
@@ -121,6 +130,8 @@ class SequenzyCore(
     private val logger: SequenzyLogger = SequenzyLogger { level, message -> println("[Sequenzy] $level: $message") },
     private val scope: CoroutineScope,
     private val now: () -> Long = System::currentTimeMillis,
+    /** Fresh tokens for users identified with [identifyUser]. */
+    @Volatile var userIdentityTokenProvider: UserIdentityTokenProvider? = null,
 ) {
     companion object {
         const val MAX_QUEUED_EVENTS = 100
@@ -130,11 +141,16 @@ class SequenzyCore(
         const val MAX_BACKOFF_MS = 5L * 60 * 1000
         /** Server limit for one event's properties, serialized. */
         const val MAX_PROPERTIES_BYTES = 8 * 1024
+        /** Placement keys one request can ask for. */
+        const val MAX_PLACEMENTS_PER_REQUEST = 10
         const val PROVIDER_RETRY_MS = 60_000L
         const val PROVIDER_TIMEOUT_MS = 20_000L
+        /** Server limit for an external ID (the contact's `externalId`). */
+        const val MAX_EXTERNAL_ID_LENGTH = 255
 
         private const val KEY_ANONYMOUS_ID = "anonymousId"
         private const val KEY_EMAIL = "email"
+        private const val KEY_EXTERNAL_ID = "externalId"
         private const val KEY_IDENTITY_TOKEN = "identityToken"
         private const val KEY_EVENTS = "events"
         private const val KEY_PUSH_TOKEN = "pushToken"
@@ -155,6 +171,16 @@ class SequenzyCore(
     /** After a failed provider call, don't ask again before this time. */
     private var providerRetryAt = 0L
 
+    /** Android Live Updates: tokens, received pushes and app-started activities. */
+    val liveUpdates: LiveUpdates = LiveUpdates(this, store) { now() }
+
+    /**
+     * Called with the ids of Live Updates that stopped belonging to this
+     * device's user (reset, or another person signed in), so the Android
+     * layer removes their notifications.
+     */
+    @Volatile var onLiveUpdatesRemoved: ((List<String>) -> Unit)? = null
+
     // region Identity
 
     /** Stable per installation until [reset]. */
@@ -164,35 +190,86 @@ class SequenzyCore(
 
     val email: String? get() = store.getString(KEY_EMAIL)
 
+    /** The user ID passed to [identifyUser], or null. */
+    val externalId: String? get() = store.getString(KEY_EXTERNAL_ID)
+
+    /**
+     * One string per signed-in contact: the external ID when the app
+     * identified the user by it, otherwise the email; null while anonymous.
+     * Compare it to notice that another user signed in. The space keeps an
+     * external ID from ever equalling an email.
+     */
+    val contactKey: String? get() = contactKey(email, externalId)
+
+    private fun contactKey(email: String?, externalId: String?): String? =
+        externalId?.let { "external $it" } ?: email
+
+    /** The identifiers every identified request carries. */
+    private fun identityFields(): JsonObject = buildJsonObject {
+        email?.let { put("email", it) }
+        externalId?.let { put("externalId", it) }
+    }
+
     val pushToken: String? get() = store.getString(KEY_PUSH_TOKEN)
 
     suspend fun queuedEventCount(): Int = mutex.withLock { events.size }
 
-    /** Links this installation to a contact. Pass the token your backend minted, or rely on the provider. */
+    /** Links this installation to the contact with this email. Pass the token your backend minted, or rely on the provider. */
     suspend fun identify(email: String, identityToken: String? = null) = mutex.withLock {
         val normalized = email.trim().lowercase()
         if (!normalized.contains("@") || normalized.contains(" ")) {
             log(LogLevel.ERROR, "identify was called with an invalid email address")
             return@withLock
         }
-        val previous = this.email
-        if (previous != normalized) {
-            if (previous != null) {
-                // Events and profile changes queued for the previous user must
-                // not be sent as the new one.
-                events.clear()
-                persistEvents()
-                store.putString(KEY_PROFILE, null)
-            }
-            store.putString(KEY_EMAIL, normalized)
-            store.putString(KEY_IDENTITY_TOKEN, null)
-            // Another contact's recent geofence transitions must not suppress this one's.
-            store.putString(KEY_GEOFENCE_TRANSITIONS, null)
+        identifyLocked(normalized, null, identityToken)
+    }
+
+    /**
+     * Links this installation to the contact with your own user ID, for users
+     * without an email (phone login, a hidden address). Pass [email] too when
+     * you have it. The identity token must be minted for exactly these
+     * identifiers; without one, [userIdentityTokenProvider] is asked.
+     */
+    suspend fun identifyUser(externalId: String, email: String? = null, identityToken: String? = null) = mutex.withLock {
+        val id = externalId.trim()
+        if (id.isEmpty() || id.length > MAX_EXTERNAL_ID_LENGTH) {
+            log(LogLevel.ERROR, "identifyUser needs a user ID of 1 to $MAX_EXTERNAL_ID_LENGTH characters")
+            return@withLock
         }
+        val normalizedEmail = email?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (normalizedEmail != null && (!normalizedEmail.contains("@") || normalizedEmail.contains(" "))) {
+            log(LogLevel.ERROR, "identifyUser was called with an invalid email address")
+            return@withLock
+        }
+        identifyLocked(normalizedEmail, id, identityToken)
+    }
+
+    private suspend fun identifyLocked(nextEmail: String?, nextExternalId: String?, identityToken: String?) {
+        val previous = contactKey
+        val contactChanged = previous != contactKey(nextEmail, nextExternalId)
+        val identifiersChanged = email != nextEmail || externalId != nextExternalId
+        if (previous != null && contactChanged) {
+            // Events and profile changes queued for the previous user must
+            // not be sent as the new one.
+            events.clear()
+            persistEvents()
+            store.putString(KEY_PROFILE, null)
+            // So are the previous user's running Live Updates; the
+            // device's push-to-start tokens move to the new contact.
+            liveUpdatesRemoved(liveUpdates.userChangedLocked())
+        }
+        if (identifiersChanged) {
+            // A token verifies only with the exact identifiers it was minted for.
+            store.putString(KEY_EMAIL, nextEmail)
+            store.putString(KEY_EXTERNAL_ID, nextExternalId)
+            store.putString(KEY_IDENTITY_TOKEN, null)
+        }
+        // Another contact's recent geofence transitions must not suppress this one's.
+        if (contactChanged) store.putString(KEY_GEOFENCE_TRANSITIONS, null)
         if (!identityToken.isNullOrEmpty()) store.putString(KEY_IDENTITY_TOKEN, identityToken)
         identityBlocked = false
         providerRetryAt = 0
-        registerPushLocked(force = previous != normalized)
+        registerPushLocked(force = identifiersChanged)
         flushLocked()
     }
 
@@ -209,7 +286,9 @@ class SequenzyCore(
                 .onSuccess { if (it.status !in 200..299) log(LogLevel.ERROR, "Could not unregister the push token (HTTP ${it.status})") }
                 .onFailure { log(LogLevel.ERROR, "Could not unregister the push token: ${it.message}") }
         }
+        liveUpdatesRemoved(liveUpdates.resetLocked())
         store.putString(KEY_EMAIL, null)
+        store.putString(KEY_EXTERNAL_ID, null)
         store.putString(KEY_IDENTITY_TOKEN, null)
         store.putString(KEY_PUSH_REGISTRATION, null)
         store.putString(KEY_ANONYMOUS_ID, UUID.randomUUID().toString())
@@ -347,7 +426,7 @@ class SequenzyCore(
 
     private suspend fun flushLocked() {
         parseObject(store.getString(KEY_PROFILE))?.let { profile ->
-            if (email == null || identityBlocked) return
+            if (contactKey == null || identityBlocked) return
             val next = nextAttemptAt
             if (next != null && next > now()) return
             when (sendProfile(profile)) {
@@ -365,7 +444,7 @@ class SequenzyCore(
         }
         dropStaleEvents()
         while (events.isNotEmpty()) {
-            if (email == null || identityBlocked) return
+            if (contactKey == null || identityBlocked) return
             val next = nextAttemptAt
             if (next != null && next > now()) return
             val batch = events.take(MAX_BATCH_SIZE)
@@ -388,13 +467,13 @@ class SequenzyCore(
     private enum class BatchOutcome { DELIVERED, DROPPED, RETRY_LATER, STOP }
 
     private suspend fun sendBatch(batch: List<QueuedEvent>): BatchOutcome {
-        val result = withIdentity { email, token ->
+        val result = withIdentity { identity, token ->
             post(
                 "/api/v1/app-events",
                 buildJsonObject {
                     put("companyId", configuration.companyId)
                     put("publicKey", configuration.publicKey)
-                    put("email", email)
+                    identity.forEach { (key, value) -> put(key, value) }
                     put("identityToken", token)
                     put(
                         "events",
@@ -431,13 +510,13 @@ class SequenzyCore(
     }
 
     private suspend fun sendProfile(profile: JsonObject): BatchOutcome {
-        val result = withIdentity { email, token ->
+        val result = withIdentity { identity, token ->
             post(
                 "/api/v1/app-attributes",
                 buildJsonObject {
                     put("companyId", configuration.companyId)
                     put("publicKey", configuration.publicKey)
-                    put("email", email)
+                    identity.forEach { (key, value) -> put(key, value) }
                     put("identityToken", token)
                     profile.forEach { (key, value) -> put(key, value) }
                 },
@@ -540,7 +619,7 @@ class SequenzyCore(
 
     private suspend fun registerPushLocked(force: Boolean) {
         val token = store.getString(KEY_PUSH_TOKEN) ?: return
-        val identity = email ?: ""
+        val identity = contactKey ?: ""
         val permission = runCatching { pushPermissionReader?.invoke() }.getOrNull()
         if (!force) {
             val last = parseObject(store.getString(KEY_PUSH_REGISTRATION))
@@ -567,10 +646,10 @@ class SequenzyCore(
             device.timezone?.takeIf { it.isNotEmpty() }?.let { put("timezone", it) }
         }
 
-        val response: HttpResponse = if (email != null) {
+        val response: HttpResponse = if (contactKey != null) {
             when (
-                val result = withIdentity { email, identityToken ->
-                    post("/api/v1/push/app-devices", JsonObject(base + mapOf("email" to JsonPrimitive(email), "identityToken" to JsonPrimitive(identityToken))))
+                val result = withIdentity { fields, identityToken ->
+                    post("/api/v1/push/app-devices", JsonObject(base + fields + mapOf("identityToken" to JsonPrimitive(identityToken))))
                 }
             ) {
                 is IdentifiedResult.Response -> result.response
@@ -607,6 +686,9 @@ class SequenzyCore(
         if ((parsed?.get("pushConfigured") as? JsonPrimitive)?.booleanOrNull == false) {
             log(LogLevel.INFO, "Device registered, but ${configuration.platform} push credentials are not set up in Sequenzy yet")
         }
+        // Live Update tokens are sent to this FCM token and contact: link them
+        // again whenever either may have changed.
+        if (configuration.platform == "android") liveUpdates.resendLocked()
     }
 
     /** Reports a push as delivered or clicked; the payload's click token authenticates it. */
@@ -649,13 +731,13 @@ class SequenzyCore(
         limit: Int?,
         formats: List<InAppMessage.Format>?,
     ): List<InAppMessage> = mutex.withLock {
-        val result = withIdentity { email, token ->
+        val result = withIdentity { identity, token ->
             post(
                 "/api/v1/in-app/feed",
                 buildJsonObject {
                     put("companyId", configuration.companyId)
                     put("publicKey", configuration.publicKey)
-                    put("email", email)
+                    identity.forEach { (key, value) -> put(key, value) }
                     put("identityToken", token)
                     kind?.let { put("kind", it.wire) }
                     limit?.let { put("limit", it) }
@@ -679,6 +761,40 @@ class SequenzyCore(
         }
     }
 
+    /**
+     * What each placement shows the identified contact: its highest-priority open item. Keys missing from the result
+     * have nothing to show, so their slots collapse. Up to [MAX_PLACEMENTS_PER_REQUEST] keys.
+     */
+    suspend fun fetchPlacements(placements: List<String>): Map<String, InAppMessage> = mutex.withLock {
+        val keys = placements.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(MAX_PLACEMENTS_PER_REQUEST)
+        if (keys.isEmpty()) return@withLock emptyMap()
+        val result = withIdentity { identity, token ->
+            post(
+                "/api/v1/in-app/feed/placements",
+                buildJsonObject {
+                    put("companyId", configuration.companyId)
+                    put("publicKey", configuration.publicKey)
+                    identity.forEach { (key, value) -> put(key, value) }
+                    put("identityToken", token)
+                    put("placements", JsonArray(keys.map { JsonPrimitive(it) }))
+                    if (handlesPushPermission) {
+                        put("actions", JsonArray(listOf(JsonPrimitive(InAppButton.Action.REQUEST_PUSH_PERMISSION.wire))))
+                    }
+                },
+            )
+        }
+        when (result) {
+            is IdentifiedResult.NotIdentified -> throw SequenzyException.NotIdentified()
+            is IdentifiedResult.Rejected -> throw SequenzyException.IdentityRejected()
+            is IdentifiedResult.Failed -> throw result.error
+            is IdentifiedResult.Response -> {
+                val response = result.response
+                if (response.status !in 200..299) throw SequenzyException.Http(response.status, errorMessage(response.body))
+                InAppMessage.mapFromPlacements(json.parseToJsonElement(response.body), keys)
+            }
+        }
+    }
+
     /** Reports `displayed`, `clicked`, `dismissed` or `read` for a feed item. */
     suspend fun report(type: InAppEventType, messageId: String): Boolean = report(type, messageId, null)
 
@@ -692,13 +808,13 @@ class SequenzyCore(
         buttonId: String?,
         pushPermission: PushPermissionStatus? = null,
     ): Boolean = mutex.withLock {
-        val result = withIdentity { email, token ->
+        val result = withIdentity { identity, token ->
             post(
                 "/api/v1/in-app/feed/events",
                 buildJsonObject {
                     put("companyId", configuration.companyId)
                     put("publicKey", configuration.publicKey)
-                    put("email", email)
+                    identity.forEach { (key, value) -> put(key, value) }
                     put("identityToken", token)
                     put("messageId", messageId)
                     put("type", type.wire)
@@ -720,13 +836,13 @@ class SequenzyCore(
 
     /** The nearest active geofences around a position, rounded to two decimals here. */
     suspend fun fetchNearbyGeofences(latitude: Double, longitude: Double, limit: Int): NearbyGeofences = mutex.withLock {
-        val result = withIdentity { email, token ->
+        val result = withIdentity { identity, token ->
             post(
                 "/api/v1/geofences/nearby",
                 buildJsonObject {
                     put("companyId", configuration.companyId)
                     put("publicKey", configuration.publicKey)
-                    put("email", email)
+                    identity.forEach { (key, value) -> put(key, value) }
                     put("identityToken", token)
                     put("latitude", Geofencing.roundCoordinate(latitude))
                     put("longitude", Geofencing.roundCoordinate(longitude))
@@ -768,7 +884,7 @@ class SequenzyCore(
         atMillis: Long? = null,
     ): Int = mutex.withLock {
         // Visits belong to a contact; never queue one for whoever signs in next.
-        if (email == null) return@withLock 0
+        if (contactKey == null) return@withLock 0
         val at = atMillis ?: now()
         val recent = (parseObject(store.getString(KEY_GEOFENCE_TRANSITIONS)) ?: JsonObject(emptyMap()))
             .mapValues { (_, value) -> value.jsonPrimitive.content.toLongOrNull() ?: 0L }
@@ -819,25 +935,25 @@ class SequenzyCore(
     }
 
     /**
-     * Runs [operation] with the stored email and token, asking the provider
-     * when none is stored, and once more when the server rejects it.
+     * Runs [operation] with the stored identifiers and token, asking the
+     * provider when none is stored, and once more when the server rejects it.
      */
-    private suspend fun withIdentity(operation: suspend (email: String, token: String) -> HttpResponse): IdentifiedResult {
-        val email = email ?: return IdentifiedResult.NotIdentified
-        if (identityBlocked) return IdentifiedResult.NotIdentified
+    private suspend fun withIdentity(operation: suspend (identity: JsonObject, token: String) -> HttpResponse): IdentifiedResult {
+        if (contactKey == null || identityBlocked) return IdentifiedResult.NotIdentified
+        val identity = identityFields()
         var usedProvider = false
         var token = store.getString(KEY_IDENTITY_TOKEN)
         if (token == null) {
-            token = tokenFromProvider(email)
+            token = tokenFromProvider()
             usedProvider = true
         }
         var current = token ?: run {
-            log(LogLevel.INFO, "No identity token yet; call identify(email, identityToken) or set an identity token provider")
+            log(LogLevel.INFO, "No identity token yet; pass one to identify or identifyUser, or set an identity token provider")
             return IdentifiedResult.NotIdentified
         }
         while (true) {
             val response = try {
-                operation(email, current)
+                operation(identity, current)
             } catch (error: Exception) {
                 if (error is kotlinx.coroutines.CancellationException) throw error
                 return IdentifiedResult.Failed(error)
@@ -846,26 +962,44 @@ class SequenzyCore(
             store.putString(KEY_IDENTITY_TOKEN, null)
             if (!usedProvider) {
                 usedProvider = true
-                val fresh = tokenFromProvider(email)
+                val fresh = tokenFromProvider()
                 if (fresh != null) {
                     current = fresh
                     continue
                 }
             }
             identityBlocked = true
-            log(LogLevel.ERROR, "The identity token was rejected; call identify(email, identityToken) with a fresh token")
+            log(LogLevel.ERROR, "The identity token was rejected; call identify or identifyUser again with a fresh token")
             return IdentifiedResult.Rejected
         }
     }
 
-    private suspend fun tokenFromProvider(email: String): String? {
-        val provider = identityTokenProvider ?: return null
+    /**
+     * A fresh token for the current identity: from [userIdentityTokenProvider]
+     * for a user identified by external ID, otherwise from
+     * [identityTokenProvider] with the email.
+     */
+    private suspend fun tokenFromProvider(): String? {
+        val contact = contactKey
+        val email = email
+        val externalId = externalId
+        val request: suspend () -> String = when {
+            externalId != null -> {
+                val provider = userIdentityTokenProvider ?: return null
+                suspend { provider.fetchIdentityToken(externalId, email) }
+            }
+            email != null -> {
+                val provider = identityTokenProvider ?: return null
+                suspend { provider.fetchIdentityToken(email) }
+            }
+            else -> return null
+        }
         if (now() < providerRetryAt) return null
         return try {
             // Runs while the SDK's lock is held: a provider that never returns
             // (or calls back into the SDK) must not stall every later call.
-            val token = kotlinx.coroutines.withTimeout(PROVIDER_TIMEOUT_MS) { provider.fetchIdentityToken(email) }
-            token.takeIf { it.isNotEmpty() && this.email == email }
+            val token = kotlinx.coroutines.withTimeout(PROVIDER_TIMEOUT_MS) { request() }
+            token.takeIf { it.isNotEmpty() && contactKey == contact }
                 ?.also { store.putString(KEY_IDENTITY_TOKEN, it) }
         } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException && error !is kotlinx.coroutines.TimeoutCancellationException) throw error
@@ -878,6 +1012,44 @@ class SequenzyCore(
     private fun isIdentityRejection(response: HttpResponse): Boolean {
         if (response.status != 401 && response.status != 403) return false
         return parseObject(response.body)?.string("code") == "invalid_web_tracking_identity"
+    }
+
+    // endregion
+
+    // region Live Update plumbing (LiveUpdates.kt holds the rules)
+
+    internal suspend fun <T> locked(block: suspend () -> T): T = mutex.withLock { block() }
+
+    internal fun logLocked(level: LogLevel, message: String) = log(level, message)
+
+    /** Posts anonymously; null when the request could not be sent. */
+    internal suspend fun postLocked(path: String, body: JsonObject): HttpResponse? =
+        runCatching { post(path, body) }.getOrNull()
+
+    /**
+     * Posts with the signed-in contact's identity, like device registration:
+     * without a usable identity token it registers anonymously and links on
+     * the next identify. Null when the request could not be sent.
+     */
+    internal suspend fun postWithIdentityLocked(path: String, body: JsonObject): HttpResponse? {
+        if (contactKey == null) return postLocked(path, body)
+        return when (
+            val result = withIdentity { fields, identityToken ->
+                post(path, JsonObject(body + fields + mapOf("identityToken" to JsonPrimitive(identityToken))))
+            }
+        ) {
+            is IdentifiedResult.Response -> result.response
+            is IdentifiedResult.NotIdentified, is IdentifiedResult.Rejected -> postLocked(path, body)
+            is IdentifiedResult.Failed -> {
+                log(LogLevel.INFO, "Live Update registration failed: ${result.error.message}")
+                null
+            }
+        }
+    }
+
+    private fun liveUpdatesRemoved(activityIds: List<String>) {
+        if (activityIds.isEmpty()) return
+        runCatching { onLiveUpdatesRemoved?.invoke(activityIds) }
     }
 
     // endregion

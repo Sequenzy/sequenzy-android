@@ -10,7 +10,7 @@ Full guide: [Mobile SDKs](https://docs.sequenzy.com/concepts/mobile-sdks).
 
 ```kotlin
 dependencies {
-    implementation("com.sequenzy:sequenzy-android:0.1.2")
+    implementation("com.sequenzy:sequenzy-android:0.1.3")
     implementation("com.google.firebase:firebase-messaging:24.1.0") // for push
 }
 ```
@@ -33,6 +33,7 @@ class MyApp : Application() {
 }
 
 Sequenzy.identify(user.email)                   // after sign-in
+Sequenzy.identifyUser(user.id)                  // or by your user ID, for users without an email
 Sequenzy.track("workout_completed", mapOf("minutes" to 30))
 Sequenzy.reset()                                 // on sign-out
 val cards = Sequenzy.fetchCards()                // suspend; inbox screen
@@ -53,6 +54,53 @@ permission. With a `singleTop` or
 `onNewIntent`. Set
 `Sequenzy.inAppListener` to veto messages or open links yourself, and
 `Sequenzy.notificationIcon` for the small icon.
+
+## Live Updates
+
+Your backend starts, updates and ends Android Live Updates with the same
+Sequenzy calls as iOS Live Activities. On Android 16 with promotion (API
+36.1) they are promoted: top of the shade and lock screen, plus a status bar
+chip. Earlier versions show an ongoing notification that updates in place (a
+plain progress bar, the chip text as subtext). Observe each type in `Application.onCreate`, with the name
+of your iOS attributes type:
+
+```kotlin
+SequenzyLiveUpdates.observe("DeliveryAttributes") { _, activity ->
+    LiveUpdateContent(
+        title = "Order ${activity.attributes["orderNumber"]}",
+        text = activity.contentState["status"] as? String,
+        shortCriticalText = "5 min",            // status bar chip, Android 16
+        progress = (activity.contentState["progress"] as? Number)?.toInt(),
+    )
+}
+
+// Optional: start, update and end from the app
+SequenzyLiveUpdates.start("DeliveryAttributes", "order-1234", mapOf("orderNumber" to "1234"), mapOf("status" to "preparing"))
+SequenzyLiveUpdates.end("order-1234", mapOf("status" to "delivered"))
+```
+
+The SDK receives the FCM data messages in `SequenzyMessagingService` (apps
+with their own service call `SequenzyMessagingService.handleMessage`), applies
+only pushes newer than the last one, reports the person swiping one away,
+and removes running Live Updates on `reset()`. It needs notification
+permission and declares `POST_PROMOTED_NOTIFICATIONS`.
+`SequenzyLiveUpdates.canPostPromotedNotifications(context)` says whether
+Android 16 promotes them for this app.
+
+## Placements
+
+Show in-app content inline, in a slot of your own layout, for a
+[placement](https://docs.sequenzy.com/concepts/in-app-placements) defined in Sequenzy. The view is `GONE` while
+the contact has nothing to show.
+
+```kotlin
+container.addView(SequenzyPlacementView(context, "home_hero"))
+// XML: <com.sequenzy.android.SequenzyPlacementView android:tag="home_hero" ... />
+// Compose: AndroidView(factory = { SequenzyPlacementView(it, "home_hero") })
+```
+
+To draw it yourself, use `SequenzyPlacements.observe("home_hero") { item -> }`,
+`logDisplayed(item)` and `dismiss(item)`.
 
 ## Geofencing
 
@@ -105,7 +153,9 @@ consumer ProGuard rules keep the bridge when your app is minified.
 ```
 
 The Android modules are only included when `ANDROID_HOME` or `local.properties`
-points at an Android SDK. Tests run against `../contract/fixtures`. This repository is updated from Sequenzy's SDK
+points at an Android SDK. For real pushes and Live Updates in the example, put
+your Firebase project's `google-services.json` (package `com.sequenzy.example`)
+in `example/`; without it the example builds without Firebase. Tests run against `../contract/fixtures`. This repository is updated from Sequenzy's SDK
 sources with every release.
 
 ## Links
@@ -117,3 +167,11 @@ sources with every release.
   and [in-app messages](https://docs.sequenzy.com/concepts/in-app-messages)
 - [Pricing](https://sequenzy.com/pricing)
 - Other Sequenzy SDKs: [iOS](https://github.com/Sequenzy/sequenzy-swift), [React Native](https://github.com/Sequenzy/sequenzy-react-native), [Flutter](https://github.com/Sequenzy/sequenzy-flutter)
+
+## Users without an email
+
+For users who sign in without an email (a hidden Apple address, phone login),
+mint the identity token for your user ID as `externalId` and call
+`identifyUser` with the same ID (and the email, when you minted with it). Set
+`userIdentityTokenProvider` to renew these tokens. See
+[Users without an email](https://docs.sequenzy.com/concepts/mobile-sdks#users-without-an-email).

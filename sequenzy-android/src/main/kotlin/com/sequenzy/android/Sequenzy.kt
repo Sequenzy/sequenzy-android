@@ -35,6 +35,7 @@ import com.sequenzy.core.SequenzyException
 import com.sequenzy.core.SequenzyLogger
 import com.sequenzy.core.SubscribeRequest
 import com.sequenzy.core.SubscribeResult
+import com.sequenzy.core.UserIdentityTokenProvider
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -135,6 +136,8 @@ object Sequenzy {
      *
      * @param appId defaults to the package name; add it to the key's allowed app IDs.
      * @param identityTokenProvider fetches a fresh identity token from your backend.
+     * @param userIdentityTokenProvider the same for users identified with [identifyUser]:
+     *   mint the token for the external ID (and the email, when it is passed).
      * @param showInAppMessages set false to present messages yourself from [fetchMessages].
      */
     @JvmStatic
@@ -148,6 +151,7 @@ object Sequenzy {
         identityTokenProvider: IdentityTokenProvider? = null,
         showInAppMessages: Boolean = true,
         logLevel: LogLevel = LogLevel.ERROR,
+        userIdentityTokenProvider: UserIdentityTokenProvider? = null,
     ) {
         if (core != null) return
         this.application = application
@@ -165,7 +169,11 @@ object Sequenzy {
             scope = scope,
             pushPermissionReader = { PushPermissions.status(application) },
             handlesPushPermission = true,
+            userIdentityTokenProvider = userIdentityTokenProvider,
         )
+        // Live Updates of a person who signed out (or was replaced by another
+        // sign-in) must not stay on this device.
+        core?.onLiveUpdatesRemoved = { ids -> SequenzyLiveUpdates.cancel(application, ids) }
         presenter = InAppPresenter()
         application.registerActivityLifecycleCallbacks(ActivityTracker)
         ProcessLifecycleOwner.get().lifecycle.addObserver(ForegroundObserver)
@@ -180,8 +188,27 @@ object Sequenzy {
         val core = requireCore() ?: return
         enqueue {
             core.identify(email, identityToken)
-            val signedIn = core.email
+            val signedIn = core.contactKey
             withContext(Dispatchers.Main) { presenter?.signedIn(signedIn) }
+            SequenzyPlacements.identityChanged(signedIn)
+            refreshMessages(force = true)
+        }
+    }
+
+    /**
+     * Identifies the user by your own user ID, for users without an email
+     * (phone login, a hidden address). Pass [email] too when you have it; the
+     * identity token must be minted for exactly these identifiers.
+     */
+    @JvmStatic
+    @JvmOverloads
+    fun identifyUser(externalId: String, email: String? = null, identityToken: String? = null) {
+        val core = requireCore() ?: return
+        enqueue {
+            core.identifyUser(externalId, email, identityToken)
+            val signedIn = core.contactKey
+            withContext(Dispatchers.Main) { presenter?.signedIn(signedIn) }
+            SequenzyPlacements.identityChanged(signedIn)
             refreshMessages(force = true)
         }
     }
@@ -193,6 +220,7 @@ object Sequenzy {
             core.reset()
             // Views belong to the main thread, whichever thread called reset.
             mainHandler.post { presenter?.dismissAll() }
+            SequenzyPlacements.identityChanged(null)
         }
     }
 
@@ -261,6 +289,11 @@ object Sequenzy {
     @JvmStatic
     fun setIdentityTokenProvider(provider: IdentityTokenProvider?) {
         requireCore()?.identityTokenProvider = provider
+    }
+
+    @JvmStatic
+    fun setUserIdentityTokenProvider(provider: UserIdentityTokenProvider?) {
+        requireCore()?.userIdentityTokenProvider = provider
     }
 
     // endregion
@@ -333,6 +366,14 @@ object Sequenzy {
             if (includeHtml) InAppMessage.Format.entries.toList() else null,
         )
 
+    /**
+     * What each placement shows the identified contact; keys missing from the result collapse. [SequenzyPlacementView]
+     * calls this for you.
+     */
+    @JvmStatic
+    suspend fun fetchPlacements(placements: List<String>): Map<String, InAppMessage> =
+        (requireCore() ?: throw SequenzyException.NotIdentified()).fetchPlacements(placements)
+
     /** Content cards for an inbox or feed screen, pinned cards first. */
     @JvmStatic
     suspend fun fetchCards(limit: Int? = null): List<InAppMessage> =
@@ -367,9 +408,16 @@ object Sequenzy {
         }
     }
 
-    /** The identified contact's email, or null. Geofencing runs only then. */
+    /** The identified contact's email, or null (also for a user identified by external ID only). */
     @JvmStatic
     fun identifiedEmail(): String? = core?.email
+
+    /**
+     * One string per identified contact (see [SequenzyCore.contactKey]), or
+     * null while anonymous. Geofencing runs only while it is set.
+     */
+    @JvmStatic
+    fun identifiedContact(): String? = core?.contactKey
 
     /**
      * The nearest geofences around a position, rounded to about 1 km before it
@@ -410,11 +458,11 @@ object Sequenzy {
         // that ran a moment after it was scheduled.
         if (!force && now - lastFeedFetchAt < feedRefreshIntervalMs * 9 / 10) return
         lastFeedFetchAt = now
-        val owner = core.email
+        val owner = core.contactKey
         val messages = runCatching {
             core.fetchFeed(InAppMessage.Kind.MESSAGE, null, displayedFormats)
         }.getOrNull() ?: return
-        if (core.email != owner) return
+        if (core.contactKey != owner) return
         withContext(Dispatchers.Main) { presenter?.enqueue(messages, owner) }
     }
 
@@ -424,8 +472,11 @@ object Sequenzy {
 
     internal const val EXTRA_HANDLED = "com.sequenzy.handled"
 
-    /** The identified contact's email, as normalized by identify. */
-    internal val signedInEmail: String? get() = core?.email
+    /** The configured core, without the error [requireCore] logs. */
+    internal val currentCore: SequenzyCore? get() = core
+
+    /** The identified contact's key (see [SequenzyCore.contactKey]). */
+    internal val signedInContact: String? get() = core?.contactKey
 
     internal fun reportFromPresenter(type: InAppEventType, messageId: String, buttonId: String? = null) {
         val core = core ?: return
@@ -455,6 +506,13 @@ object Sequenzy {
 
     internal val resumedActivity: Activity? get() = currentActivity?.get()
 
+    internal fun liveUpdateCore(): SequenzyCore? = requireCore()
+
+    internal fun application(): Application? = application
+
+    /** Live Update changes run in order with identify and reset. */
+    internal fun enqueueLiveUpdate(command: suspend () -> Unit) = enqueue(command)
+
     private fun requireCore(): SequenzyCore? {
         if (core == null) Log.e(TAG, "Call Sequenzy.configure(application, publicKey, companyId) first")
         return core
@@ -479,6 +537,7 @@ object Sequenzy {
                 core.registerPushIfNeeded()
                 refreshMessages()
             }
+            SequenzyPlacements.appForegrounded()
             // Poll while in the foreground so a message created by something
             // the user just did (a tracked event starting a sequence) shows up
             // without leaving the app.

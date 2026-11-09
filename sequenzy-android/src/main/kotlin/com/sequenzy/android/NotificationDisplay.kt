@@ -62,7 +62,7 @@ internal object NotificationDisplay {
     }
 
     /** Android 13+ needs the runtime permission; earlier versions only the app-level switch. */
-    private fun canPostNotifications(context: Context): Boolean {
+    fun canPostNotifications(context: Context): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
